@@ -1,8 +1,3 @@
-Basic web server written in C for learning purposes
+# lemgnix
 
-To-do: 
-- [ ] Bind sockets
-- [ ] Handle responses
-- [ ] Create config file for managing variables
-- [ ] HTTP GET Requests
-
+Super web server written in C for learning purposes. Created to get a experience working with and better understanding of sockets.
