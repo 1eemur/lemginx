@@ -14,9 +14,29 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <limits.h>
+#include <libgen.h>
 
 #define PORT 8080
 #define BUFFER_SIZE 104857600
+
+char *get_server_directory() {
+	char full_path[PATH_MAX];
+	// Get the full path of the current source file (main.c)
+	if (realpath(__FILE__, full_path) == NULL) {
+			perror("realpath error");
+			return NULL;
+	}
+	// Get the directory of the source file (dirname)
+	char *dir = dirname(full_path);
+	// Return a copy of the directory path
+	char *server_dir = strdup(dir);
+	if (server_dir == NULL) {
+			perror("strdup error");
+			return NULL;
+	}
+	return server_dir;
+}
 
 const char *get_file_extension(const char *file_name) {
 	// Returns a pointer to the last dot in the string provided
@@ -27,11 +47,11 @@ const char *get_file_extension(const char *file_name) {
 
 const char *get_mime_type(const char *file_ext) {
 	// Compare file extension with common file extensions served by a web server
-	if (strcasecmp(file_ext, "html") == 0 || strcasecmp(file_ext, "htm") == 0) return "text/html";
-	else if (strcasecmp(file_ext, "txt") == 0) return "text/plain";
-	else if (strcasecmp(file_ext, "jpg") == 0 || strcasecmp(file_ext, "jpeg") == 0) return "image/jpeg";
-	else if (strcasecmp(file_ext, "png") == 0) return "image/png";
-    else return "application/octet-stream";
+	if(strcasecmp(file_ext, "html") == 0 || strcasecmp(file_ext, "htm") == 0) return "text/html";
+	else if(strcasecmp(file_ext, "txt") == 0) return "text/plain";
+	else if(strcasecmp(file_ext, "jpg") == 0 || strcasecmp(file_ext, "jpeg") == 0) return "image/jpeg";
+	else if(strcasecmp(file_ext, "png") == 0) return "image/png";
+	else return "application/octet-stream";
 }
 
 bool case_insensitive_compare(const char *s1, const char *s2) {
@@ -43,29 +63,44 @@ bool case_insensitive_compare(const char *s1, const char *s2) {
 	}
 	return *s1 == *s2;
 }
+#include <libgen.h>  // For basename
 
 char *get_file_case_insensitive(const char *file_name) {
-	// Open current directory
-	DIR *dir = opendir(".");
-	// Error to check to confirm that the directory has been successfully opened
-	if(dir == NULL){
-		perror("opendir error");
-		return NULL;
+    // Extract the base name (file name) from the full path
+    char *base_name = basename(file_name);  // Extracts the filename from the path
+
+    // Open current directory
+    DIR *dir = opendir(".");
+    // Error to check to confirm that the directory has been successfully opened
+    if (dir == NULL) {
+        perror("opendir error");
+        return NULL;
+    }
+
+    // Create directory stream and check directory for provided file name
+    struct dirent *entry;
+    char *found_file_name = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+        if (case_insensitive_compare(entry->d_name, base_name)) {
+            found_file_name = entry->d_name;
+            break;
+        }
+    }
+
+    // Close directory and return found file
+    closedir(dir);
+    return found_file_name;
+}
+
+char *sanitize_file_path(const char *file_name) {
+	// Prevent directory traversal by disallowing '..' or leading '/'
+	// Proper input sanitization to be added later
+	if(strstr(file_name, "../") != NULL || file_name[0] == '/') {
+			fprintf(stderr, "[ERROR] Invalid file path: %s\n", file_name);
+			return NULL;
 	}
 
-	// Create directory stream and check directory for provided file name
-	struct dirent *entry;
-	char *found_file_name = NULL;
-	while((entry = readdir(dir)) != NULL){
-		if(case_insensitive_compare(entry->d_name, file_name)){
-			found_file_name = entry->d_name;
-			break;
-		}
-	}
-
-	// Close directory and return found file
-	closedir(dir);
-	return found_file_name;
+	return strdup(file_name);
 }
 
 char *url_decode(const char *src) {
@@ -90,9 +125,9 @@ char *url_decode(const char *src) {
 }
 
 void build_http_response(const char *file_name, 
-						const char *file_ext, 
-						char *response, 
-						size_t *response_len) {
+												const char *file_ext, 
+												char *response, 
+												size_t *response_len) {
 	// Build HTTP header for response
 	const char *mime_type = get_mime_type(file_ext);
 	char *header = (char *)malloc(BUFFER_SIZE * sizeof(char));
@@ -105,18 +140,25 @@ void build_http_response(const char *file_name,
 	// Check if the file exists, if not return 404 as the HTTP response
 	int file_fd = open(file_name, O_RDONLY);
 	if(file_fd == -1){
+		fprintf(stderr, "[ERROR] File not found: %s — sending 404 response\n", file_name);
 		snprintf(response, BUFFER_SIZE,
 			"HTTP/1.1 404 Not Found\r\n"
 			"Content-Type: text/plain\r\n"
 			"\r\n"
 			"404 Not Found");
 		*response_len = strlen(response);
+		free(header);
 		return;
 	}
 
+	// Log file being served
+	printf("[INFO] Serving file: %s (MIME type: %s)\n", file_name, mime_type);
+
 	// Get file size for Content-Length
 	struct stat file_stat;
-	fstat(file_fd, &file_stat);
+	if(fstat(file_fd, &file_stat) == -1){
+		perror("[ERROR] Could not get file stats");
+	}
 	off_t file_size = file_stat.st_size;
 
 	// Copy header to the response buffer
@@ -132,6 +174,9 @@ void build_http_response(const char *file_name,
 		*response_len += bytes_read;
 	}
 
+	// Log how many bytes were sent
+	printf("[INFO] Sent %zu bytes in response for %s\n", *response_len, file_name);
+
 	// Free header memory and close file
 	free(header);
 	close(file_fd);
@@ -142,19 +187,67 @@ void *handle_client(void *arg) {
 	int client_fd = *((int *)arg);
 	char *buffer = (char *)malloc(BUFFER_SIZE * sizeof(char));
 
+	// Get the server directory
+	char *server_dir = get_server_directory();
+	if(server_dir == NULL){
+		close(client_fd);
+		free(arg);
+		free(buffer);
+		return NULL;
+	}
+
+	// Get client address for logging
+	struct sockaddr_in addr;
+	socklen_t addr_len = sizeof(addr);
+	getpeername(client_fd, (struct sockaddr *)&addr, &addr_len);
+	char client_ip[INET_ADDRSTRLEN];
+	inet_ntop(AF_INET, &(addr.sin_addr), client_ip, INET_ADDRSTRLEN);
+	
 	// Take the request from the client and store into a buffer
 	ssize_t bytes_received = recv(client_fd, buffer, BUFFER_SIZE, 0);
 	if(bytes_received > 0){
 		// Check request type 
 		regex_t regex;
-		regcomp(&regex, "^GET /([^ ]*) HTTP/1", REG_EXTENDED);
-		regmatch_t matches[2];
+		regcomp(&regex, "^([A-Z]+) /([^ ]*) HTTP/1", REG_EXTENDED);
+		regmatch_t matches[3];
 
-		if(regexec(&regex, buffer, 2, matches, 0) == 0){
+		if(regexec(&regex, buffer, 3, matches, 0) == 0){
 			// Extract filename from request and decode URL
 			buffer[matches[1].rm_eo] = '\0';
-			const char *url_encoded_file_name = buffer + matches[1].rm_so;
-			char *file_name = url_decode(url_encoded_file_name);
+			buffer[matches[2].rm_eo] = '\0';
+			const char *method = buffer + matches[1].rm_so;
+			const char *url_encoded_file_name = buffer + matches[2].rm_so;
+
+			// If no path is provided (i.e., the path is empty), use "index.html" as the default
+			char *file_name;
+			if(strlen(url_encoded_file_name) == 0){
+				file_name = strdup("index.html");
+				printf("[INFO] File not provided, serving index.html as default\n");
+			} else {
+				file_name = url_decode(url_encoded_file_name);
+			}
+
+			// Sanitize file path
+			char *safe_file_name = sanitize_file_path(file_name);
+			if (safe_file_name == NULL) {
+					// Invalid file path, respond with 400 Bad Request
+					char *response = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\n400 Bad Request";
+					send(client_fd, response, strlen(response), 0);
+					free(file_name);
+					free(safe_file_name);
+					free(server_dir);
+					close(client_fd);
+					free(arg);
+					free(buffer);
+					return NULL;
+			}
+
+			// Build the full file path
+			char full_file_path[PATH_MAX];
+			snprintf(full_file_path, PATH_MAX, "%s/%s", server_dir, safe_file_name);
+
+			printf("[INFO] %s request from %s for /%s\n", method, client_ip, file_name);
+			printf("[INFO] Full file path %s\n", full_file_path);
 
 			// Get the file extension
 			char file_ext[32];
@@ -163,18 +256,34 @@ void *handle_client(void *arg) {
 			// Build the HTTP response
 			char *response = (char *)malloc(BUFFER_SIZE * 2 * sizeof(char));
 			size_t response_len;
-			build_http_response(file_name, file_ext, response, &response_len);
 
-			// Send HTTP response to client
-			send(client_fd, response, response_len, 0);
+			int file_fd = open(full_file_path, O_RDONLY);
+			// Check if file exists
+			char *actual_file = get_file_case_insensitive(full_file_path);
+			if(actual_file != NULL) {
+					char file_ext[32];
+					strcpy(file_ext, get_file_extension(actual_file));
 
-			// Free allocated memory
-			free(response);
+					// Build the HTTP response
+					char *response = (char *)malloc(BUFFER_SIZE * 2 * sizeof(char));
+					size_t response_len;
+					build_http_response(actual_file, file_ext, response, &response_len);
+					send(client_fd, response, response_len, 0);
+					free(response);
+					free(safe_file_name);
+			}else {
+					// File not found
+					snprintf(buffer, BUFFER_SIZE,
+										"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\n404 Not Found");
+					send(client_fd, buffer, strlen(buffer), 0);
+					free(safe_file_name);
+			}
 			free(file_name);
 		}
 		regfree(&regex);
 	}
 	// Close connection and free any allocated memory before returning NULL
+	free(server_dir);
 	close(client_fd);
 	free(arg);
 	free(buffer);
