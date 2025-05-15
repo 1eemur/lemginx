@@ -16,9 +16,103 @@
 #include <unistd.h>
 #include <limits.h>
 #include <libgen.h>
+#include <time.h>
 
 #define PORT 8080
 #define BUFFER_SIZE 104857600
+#define LOGGING 0
+#define MAX_LOG_LENGTH 1024
+#define LOG_FILENAME "nginx_log.txt" 
+
+pthread_mutex_t log_file_mutex = PTHREAD_MUTEX_INITIALIZER; 
+char log_message[MAX_LOG_LENGTH];
+size_t message_len;
+
+typedef enum {
+    DEBUG,
+    INFO,
+    WARNING,
+    ERROR,
+    CRITICAL
+} log_level_t;
+
+void write_log(const char *log_message) {
+    // Check if the log_message is valid
+    if (log_message == NULL) {
+        fprintf(stderr, "Error: Null log message passed\n");
+        return;
+    }
+
+    // Open the log file in append mode
+    FILE *log_file = fopen(LOG_FILENAME, "a");
+    if (log_file == NULL) {
+        // Handle file opening failure
+        perror("Error opening log file");
+        return;
+    }
+
+    // Lock the mutex to ensure thread-safe writing to the log file
+    pthread_mutex_lock(&log_file_mutex);
+
+    // Write the log message to the file
+    if (fputs(log_message, log_file) == EOF) {
+        perror("Error writing to log file");
+    }
+
+    // Close the file after writing
+    if (fclose(log_file) == EOF) {
+        perror("Error closing log file");
+    }
+
+    // Unlock the mutex
+    pthread_mutex_unlock(&log_file_mutex);
+}
+
+void handle_log(const char *log_message, log_level_t log_level) {
+	time_t now;
+	struct tm *timeinfo;
+	char timestamp[26];
+	time(&now);
+	timeinfo = localtime(&now);
+	strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", timeinfo);
+	if (log_message == NULL) return; 
+	size_t len = strlen(log_message);
+	if (len > MAX_LOG_LENGTH) { 
+			fprintf(stderr, "Warning: Log message exceeds maximum length\n");
+	}
+
+	// Map log level to a string
+	const char *log_level_str;
+	switch (log_level) {
+			case DEBUG:
+					log_level_str = "DEBUG";
+					break;
+			case INFO:
+					log_level_str = "INFO";
+					break;
+			case WARNING:
+					log_level_str = "WARNING";
+					break;
+			case ERROR:
+					log_level_str = "ERROR";
+					break;
+			case CRITICAL:
+					log_level_str = "CRITICAL";
+					break;
+			default:
+					log_level_str = "UNKNOWN";
+					break;
+	}
+
+	char formatted_log[MAX_LOG_LENGTH];
+	size_t msg_len;
+	msg_len = snprintf(formatted_log, sizeof(formatted_log), 
+										"[%s][%s]: %s\n", timestamp, log_level_str, log_message);
+	if(LOGGING == 1){
+		write_log(formatted_log);
+	} 
+	printf("%s", formatted_log);
+}
 
 char *get_server_directory() {
 	char full_path[PATH_MAX];
@@ -63,7 +157,6 @@ bool case_insensitive_compare(const char *s1, const char *s2) {
 	}
 	return *s1 == *s2;
 }
-#include <libgen.h>  // For basename
 
 char *get_file_case_insensitive(const char *file_name) {
     // Extract the base name (file name) from the full path
@@ -94,7 +187,6 @@ char *get_file_case_insensitive(const char *file_name) {
 
 char *sanitize_file_path(const char *file_name) {
 	// Prevent directory traversal by disallowing '..' or leading '/'
-	// Proper input sanitization to be added later
 	if(strstr(file_name, "../") != NULL || file_name[0] == '/') {
 			fprintf(stderr, "[ERROR] Invalid file path: %s\n", file_name);
 			return NULL;
@@ -140,7 +232,7 @@ void build_http_response(const char *file_name,
 	// Check if the file exists, if not return 404 as the HTTP response
 	int file_fd = open(file_name, O_RDONLY);
 	if(file_fd == -1){
-		fprintf(stderr, "[ERROR] File not found: %s — sending 404 response\n", file_name);
+		printf("[ERROR] File not found: %s — sending 404 response", file_name);
 		snprintf(response, BUFFER_SIZE,
 			"HTTP/1.1 404 Not Found\r\n"
 			"Content-Type: text/plain\r\n"
@@ -152,7 +244,10 @@ void build_http_response(const char *file_name,
 	}
 
 	// Log file being served
-	printf("[INFO] Serving file: %s (MIME type: %s)\n", file_name, mime_type);
+	message_len = snprintf(log_message, sizeof(log_message), 
+												"[INFO] Serving file: %s (MIME type: %s)", 
+												file_name, mime_type);
+	handle_log(log_message, INFO);
 
 	// Get file size for Content-Length
 	struct stat file_stat;
@@ -174,8 +269,10 @@ void build_http_response(const char *file_name,
 		*response_len += bytes_read;
 	}
 
-	// Log how many bytes were sent
-	printf("[INFO] Sent %zu bytes in response for %s\n", *response_len, file_name);
+	message_len = snprintf(log_message, sizeof(log_message), 
+												"Sent %zu bytes in response for %s", 
+												*response_len, file_name);
+	handle_log(log_message, INFO);
 
 	// Free header memory and close file
 	free(header);
@@ -222,10 +319,12 @@ void *handle_client(void *arg) {
 			char *file_name;
 			if(strlen(url_encoded_file_name) == 0){
 				file_name = strdup("index.html");
-				printf("[INFO] File not provided, serving index.html as default\n");
-			} else {
-				file_name = url_decode(url_encoded_file_name);
-			}
+				message_len = snprintf(log_message, sizeof(log_message), 
+											"[INFO] File not provided, serving index.html as default");
+				handle_log(log_message, INFO);
+				} else {
+					file_name = url_decode(url_encoded_file_name);
+				}
 
 			// Sanitize file path
 			char *safe_file_name = sanitize_file_path(file_name);
@@ -246,8 +345,13 @@ void *handle_client(void *arg) {
 			char full_file_path[PATH_MAX];
 			snprintf(full_file_path, PATH_MAX, "%s/%s", server_dir, safe_file_name);
 
-			printf("[INFO] %s request from %s for /%s\n", method, client_ip, file_name);
-			printf("[INFO] Full file path %s\n", full_file_path);
+			message_len = snprintf(log_message, sizeof(log_message), 
+														"%s request from %s for /%s", method, client_ip, file_name);
+			handle_log(log_message, INFO);
+			message_len = snprintf(log_message, sizeof(log_message), 
+														"Full file path %s", full_file_path);
+			handle_log(log_message, INFO);
+
 
 			// Get the file extension
 			char file_ext[32];
@@ -277,6 +381,10 @@ void *handle_client(void *arg) {
 										"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\n404 Not Found");
 					send(client_fd, buffer, strlen(buffer), 0);
 					free(safe_file_name);
+					message_len = snprintf(log_message, sizeof(log_message), 
+																"File not found: %s — sending 404 response", 
+																file_name);
+					handle_log(log_message, ERROR);
 			}
 			free(file_name);
 		}
@@ -296,14 +404,16 @@ int main() {
 	int server_fd, max_connections = 10;
 	struct sockaddr_in server_addr;
 
+	message_len = snprintf(log_message, sizeof(log_message), 
+												"lemginx starting");
+	handle_log(log_message, DEBUG);
+
 	// Create the server socket
-	printf("lemgnix starting\n");
 	if((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0){
 		perror("Socket failed");
 		exit(EXIT_FAILURE);
 	}
 	
-	// Configure the server socket
 	// AF_INET, use IPv4 (AF_INET6 for IPv6)
 	server_addr.sin_family = AF_INET;
 	// INADDR_ANY, tells the server to accept connections from any network interface
@@ -312,7 +422,9 @@ int main() {
 	server_addr.sin_port = htons(PORT);
 
 	// Binds the socket to a port defined above, causing the socket to listen for any clients trying connect on that port
-	printf("Binding socket to port %d\n", PORT);
+	message_len = snprintf(log_message, sizeof(log_message), 
+												"Binding socket to port %d", PORT);
+	handle_log(log_message, DEBUG);
 	if(bind(server_fd, 
 			(struct sockaddr*)&server_addr,
 			sizeof(server_addr)) < 0){
@@ -321,7 +433,9 @@ int main() {
 	}
 
 	// Listen for connections
-	printf("Listening for connections on port %d\n", PORT);
+	message_len = snprintf(log_message, sizeof(log_message), 
+												"Listening for connections on port %d", PORT);
+	handle_log(log_message, INFO);
 	if(listen(server_fd, max_connections) < 0){
 		perror("Listen failed");
 		exit(EXIT_FAILURE);
